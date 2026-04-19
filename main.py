@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import yt_dlp as youtube_dl
 import io
@@ -9,20 +9,30 @@ import httpx
 
 app = FastAPI(title="YouTube Downloader API")
 
-# Configure CORS properly for production
+# Configure CORS - This is the critical part
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://www.shopyor.com",     # Your production domain
-        "https://shopyor.com",          # Without www
-        "http://localhost:3000",        # Local development
-        "http://127.0.0.1:3000",        # Local development alternative
+        "https://www.shopyor.com",
+        "https://shopyor.com",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],  # Include OPTIONS for preflight
-    allow_headers=["*"],                        # Allow all headers
-    expose_headers=["*"],                       # Expose all headers
-    max_age=3600,                               # Cache preflight results
+    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
+    allow_headers=[
+        "Accept",
+        "Accept-Language",
+        "Content-Language",
+        "Content-Type",
+        "Origin",
+        "Authorization",
+        "Access-Control-Allow-Origin",
+        "Access-Control-Allow-Headers",
+        "Access-Control-Allow-Methods",
+    ],
+    expose_headers=["Content-Disposition"],
+    max_age=86400,
 )
 
 class VideoRequest(BaseModel):
@@ -32,15 +42,32 @@ class VideoRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "YouTube Downloader API is running!"}
+    return JSONResponse(
+        content={"message": "YouTube Downloader API is running!"},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
-@app.options("/analyze")  # Handle preflight requests
+@app.options("/analyze")
 async def analyze_options():
-    return {"message": "OK"}
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
-@app.options("/download")  # Handle preflight requests
+@app.options("/download")
 async def download_options():
-    return {"message": "OK"}
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 @app.post("/analyze")
 async def analyze_video(request: VideoRequest):
@@ -59,10 +86,7 @@ async def analyze_video(request: VideoRequest):
             seen_qualities = set()
             
             for f in info.get('formats', []):
-                # Get video quality info
                 height = f.get('height')
-                width = f.get('width')
-                fps = f.get('fps')
                 format_note = f.get('format_note')
                 format_id = f.get('format_id')
                 
@@ -73,7 +97,6 @@ async def analyze_video(request: VideoRequest):
                 
                 # Determine quality label
                 if height:
-                    quality_label = f"{height}p"
                     if height >= 2160:
                         quality_label = "4K (2160p)"
                     elif height >= 1440:
@@ -101,11 +124,8 @@ async def analyze_video(request: VideoRequest):
                 else:
                     quality_label += " (no watermark)"
                 
-                # Check if it has both video and audio
-                has_video = f.get('vcodec') != 'none'
-                
                 # Skip formats without video
-                if not has_video:
+                if f.get('vcodec') == 'none':
                     continue
                 
                 # Get file size
@@ -116,7 +136,6 @@ async def analyze_video(request: VideoRequest):
                 else:
                     size_text = "Unknown"
                 
-                # Create quality key for deduplication
                 quality_key = f"{quality_label}_{has_watermark}"
                 
                 if quality_key not in seen_qualities:
@@ -126,23 +145,19 @@ async def analyze_video(request: VideoRequest):
                         'format_id': format_id,
                         'quality': quality_label,
                         'height': height,
-                        'width': width,
-                        'fps': fps,
                         'size': size_text,
-                        'has_audio': f.get('acodec') != 'none',
                         'has_watermark': has_watermark,
-                        'ext': f.get('ext', 'mp4')
                     })
             
-            # Sort formats by height (highest first) and prioritize no-watermark
+            # Sort formats
             formats.sort(key=lambda x: (x.get('height') or 0, not x.get('has_watermark')), reverse=True)
             
-            # Get best thumbnail
+            # Get thumbnail
             thumbnail = info.get('thumbnail', '')
             if not thumbnail and info.get('thumbnails'):
                 thumbnail = info['thumbnails'][-1]['url']
             
-            return {
+            response_data = {
                 'title': info.get('title', 'Unknown'),
                 'thumbnail': thumbnail,
                 'duration': info.get('duration', 0),
@@ -151,17 +166,25 @@ async def analyze_video(request: VideoRequest):
                 'formats': formats
             }
             
+            return JSONResponse(
+                content=response_data,
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
+            
     except Exception as e:
         print(f"Error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return JSONResponse(
+            content={"detail": str(e)},
+            status_code=400,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
 
 @app.post("/download")
 async def download_video(request: VideoRequest):
-    """Download the video in selected quality with option to avoid watermarks"""
+    """Download the video in selected quality"""
     try:
-        # Build format selector based on user preference
         if request.remove_watermark:
-            format_selector = 'bestvideo[format_note!~="watermarked"][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best'
+            format_selector = 'bestvideo[format_note!~="watermarked"][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
         elif request.format_id:
             format_selector = request.format_id
         else:
@@ -176,22 +199,19 @@ async def download_video(request: VideoRequest):
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(request.url, download=False)
             
-            # Get the video URL
+            # Get video URL
             video_url = None
             video_info_height = 0
             
             if request.format_id and not request.remove_watermark:
-                # Find the specific format
                 for f in info.get('formats', []):
                     if f.get('format_id') == request.format_id:
                         video_url = f.get('url')
                         break
             
             if not video_url:
-                # Get best quality URL
                 for f in info.get('formats', []):
                     if f.get('vcodec') != 'none':
-                        # If removing watermark, skip watermarked formats
                         if request.remove_watermark:
                             format_note = f.get('format_note', '')
                             if 'watermark' in format_note.lower() or 'watermarked' in format_note.lower():
@@ -211,7 +231,6 @@ async def download_video(request: VideoRequest):
             async with httpx.AsyncClient() as client:
                 response = await client.get(video_url)
                 
-                # Create filename
                 safe_title = re.sub(r'[^a-zA-Z0-9]', '_', info.get('title', 'video'))
                 watermark_suffix = "_no_watermark" if request.remove_watermark else ""
                 filename = f"{safe_title}{watermark_suffix}.mp4"
@@ -221,7 +240,7 @@ async def download_video(request: VideoRequest):
                     media_type="video/mp4",
                     headers={
                         "Content-Disposition": f"attachment; filename={filename}",
-                        "Access-Control-Allow-Origin": "*",  # Add this header
+                        "Access-Control-Allow-Origin": "*",
                         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                         "Access-Control-Allow-Headers": "*",
                     }
@@ -229,7 +248,11 @@ async def download_video(request: VideoRequest):
                 
     except Exception as e:
         print(f"Download error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return JSONResponse(
+            content={"detail": str(e)},
+            status_code=400,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
 
 if __name__ == "__main__":
     import uvicorn
