@@ -6,33 +6,24 @@ import yt_dlp as youtube_dl
 import io
 import re
 import httpx
+import os
 
 app = FastAPI(title="YouTube Downloader API")
 
-# Configure CORS - This is the critical part
+# CORS Middleware - Configured for your domain
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://www.shopyor.com",
         "https://shopyor.com",
+        "https://youtube-downloader-api-1ppa.onrender.com",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-    allow_headers=[
-        "Accept",
-        "Accept-Language",
-        "Content-Language",
-        "Content-Type",
-        "Origin",
-        "Authorization",
-        "Access-Control-Allow-Origin",
-        "Access-Control-Allow-Headers",
-        "Access-Control-Allow-Methods",
-    ],
-    expose_headers=["Content-Disposition"],
-    max_age=86400,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 class VideoRequest(BaseModel):
@@ -40,26 +31,49 @@ class VideoRequest(BaseModel):
     format_id: str = None
     remove_watermark: bool = False
 
+# Get cookies file path from environment (optional)
+COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "")
+
+def get_ydl_opts(remove_watermark=False, format_id=None):
+    """Get yt-dlp options with anti-bot measures"""
+    
+    # Base options
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'extract_flat': False,
+    }
+    
+    # Add cookies if available
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        opts['cookiefile'] = COOKIES_FILE
+    
+    # Add user agent to look like a real browser
+    opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    
+    # Add referer
+    opts['referer'] = 'https://www.youtube.com/'
+    
+    # Format selection
+    if remove_watermark:
+        opts['format'] = 'bestvideo[format_note!~="watermarked"][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+    elif format_id:
+        opts['format'] = format_id
+    else:
+        opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+    
+    return opts
+
 @app.get("/")
-def root():
+async def root():
     return JSONResponse(
-        content={"message": "YouTube Downloader API is running!"},
+        content={"message": "YouTube Downloader API is running!", "status": "active"},
         headers={"Access-Control-Allow-Origin": "*"}
     )
 
-@app.options("/analyze")
-async def analyze_options():
-    return JSONResponse(
-        content={},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        }
-    )
-
-@app.options("/download")
-async def download_options():
+@app.options("/{path:path}")
+async def options_handler(path: str):
     return JSONResponse(
         content={},
         headers={
@@ -73,15 +87,14 @@ async def download_options():
 async def analyze_video(request: VideoRequest):
     """Get video information with ALL available qualities"""
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-        }
+        ydl_opts = get_ydl_opts()
         
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(request.url, download=False)
             
-            # Collect ALL video formats
+            if not info:
+                raise HTTPException(status_code=404, detail="Could not fetch video information")
+            
             formats = []
             seen_qualities = set()
             
@@ -89,6 +102,7 @@ async def analyze_video(request: VideoRequest):
                 height = f.get('height')
                 format_note = f.get('format_note')
                 format_id = f.get('format_id')
+                fps = f.get('fps')
                 
                 # Check if format has watermark
                 has_watermark = False
@@ -118,6 +132,10 @@ async def analyze_video(request: VideoRequest):
                 else:
                     quality_label = format_note or "Unknown"
                 
+                # Add fps for better quality indication
+                if fps and fps >= 60 and height and height >= 1080:
+                    quality_label += f" {fps}fps"
+                
                 # Add watermark indicator
                 if has_watermark:
                     quality_label += " (with watermark)"
@@ -136,68 +154,77 @@ async def analyze_video(request: VideoRequest):
                 else:
                     size_text = "Unknown"
                 
-                quality_key = f"{quality_label}_{has_watermark}"
+                quality_key = f"{quality_label}_{has_watermark}_{height}"
                 
                 if quality_key not in seen_qualities:
                     seen_qualities.add(quality_key)
-                    
                     formats.append({
                         'format_id': format_id,
                         'quality': quality_label,
                         'height': height,
                         'size': size_text,
                         'has_watermark': has_watermark,
+                        'fps': fps,
                     })
             
-            # Sort formats
+            # Sort formats by height (highest first) and prioritize no-watermark
             formats.sort(key=lambda x: (x.get('height') or 0, not x.get('has_watermark')), reverse=True)
             
-            # Get thumbnail
+            # Get best thumbnail
             thumbnail = info.get('thumbnail', '')
             if not thumbnail and info.get('thumbnails'):
                 thumbnail = info['thumbnails'][-1]['url']
             
-            response_data = {
-                'title': info.get('title', 'Unknown'),
-                'thumbnail': thumbnail,
-                'duration': info.get('duration', 0),
-                'author': info.get('uploader', 'Unknown'),
-                'views': info.get('view_count', 0),
-                'formats': formats
-            }
-            
             return JSONResponse(
-                content=response_data,
+                content={
+                    'title': info.get('title', 'Unknown'),
+                    'thumbnail': thumbnail,
+                    'duration': info.get('duration', 0),
+                    'author': info.get('uploader', 'Unknown'),
+                    'views': info.get('view_count', 0),
+                    'formats': formats
+                },
                 headers={"Access-Control-Allow-Origin": "*"}
             )
             
     except Exception as e:
-        print(f"Error: {e}")
-        return JSONResponse(
-            content={"detail": str(e)},
-            status_code=400,
-            headers={"Access-Control-Allow-Origin": "*"}
-        )
+        error_msg = str(e)
+        print(f"Error: {error_msg}")
+        
+        # Provide helpful error messages
+        if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
+            return JSONResponse(
+                content={"detail": "YouTube is asking for verification. This is a temporary issue. Please try again in a few minutes or try a different video."},
+                status_code=403,
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
+        elif "429" in error_msg or "rate" in error_msg.lower():
+            return JSONResponse(
+                content={"detail": "Too many requests. Please wait a moment and try again."},
+                status_code=429,
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
+        else:
+            return JSONResponse(
+                content={"detail": error_msg},
+                status_code=400,
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
 
 @app.post("/download")
 async def download_video(request: VideoRequest):
     """Download the video in selected quality"""
     try:
-        if request.remove_watermark:
-            format_selector = 'bestvideo[format_note!~="watermarked"][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-        elif request.format_id:
-            format_selector = request.format_id
-        else:
-            format_selector = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-        
-        ydl_opts = {
-            'format': format_selector,
-            'quiet': True,
-            'no_warnings': True,
-        }
+        ydl_opts = get_ydl_opts(
+            remove_watermark=request.remove_watermark,
+            format_id=request.format_id
+        )
         
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(request.url, download=False)
+            
+            if not info:
+                raise HTTPException(status_code=404, detail="Could not fetch video information")
             
             # Get video URL
             video_url = None
@@ -227,9 +254,13 @@ async def download_video(request: VideoRequest):
             if not video_url:
                 raise HTTPException(status_code=404, detail="No video URL found")
             
-            # Download the video
-            async with httpx.AsyncClient() as client:
+            # Download the video with timeout
+            timeout = httpx.Timeout(60.0, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.get(video_url)
+                
+                if response.status_code != 200:
+                    raise HTTPException(status_code=response.status_code, detail="Failed to download video")
                 
                 safe_title = re.sub(r'[^a-zA-Z0-9]', '_', info.get('title', 'video'))
                 watermark_suffix = "_no_watermark" if request.remove_watermark else ""
@@ -241,18 +272,32 @@ async def download_video(request: VideoRequest):
                     headers={
                         "Content-Disposition": f"attachment; filename={filename}",
                         "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                        "Access-Control-Allow-Headers": "*",
+                        "Content-Length": str(len(response.content)),
                     }
                 )
                 
     except Exception as e:
-        print(f"Download error: {e}")
-        return JSONResponse(
-            content={"detail": str(e)},
-            status_code=400,
-            headers={"Access-Control-Allow-Origin": "*"}
-        )
+        error_msg = str(e)
+        print(f"Download error: {error_msg}")
+        
+        if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
+            return JSONResponse(
+                content={"detail": "YouTube verification required. Please try again in a few minutes."},
+                status_code=403,
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
+        elif "429" in error_msg:
+            return JSONResponse(
+                content={"detail": "Rate limited. Please wait and try again."},
+                status_code=429,
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
+        else:
+            return JSONResponse(
+                content={"detail": error_msg},
+                status_code=400,
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
 
 if __name__ == "__main__":
     import uvicorn
