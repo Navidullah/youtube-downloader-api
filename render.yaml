@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: youtube-downloader-api
+    runtime: python
+    repo: https://github.com/Navidullah/youtube-downloader-api
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
