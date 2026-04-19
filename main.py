@@ -9,23 +9,38 @@ import httpx
 
 app = FastAPI(title="YouTube Downloader API")
 
-# Allow your website to access this API
+# Configure CORS properly for production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://www.shopyor.com",     # Your production domain
+        "https://shopyor.com",          # Without www
+        "http://localhost:3000",        # Local development
+        "http://127.0.0.1:3000",        # Local development alternative
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],  # Include OPTIONS for preflight
+    allow_headers=["*"],                        # Allow all headers
+    expose_headers=["*"],                       # Expose all headers
+    max_age=3600,                               # Cache preflight results
 )
 
 class VideoRequest(BaseModel):
     url: str
     format_id: str = None
-    remove_watermark: bool = False  # New option
+    remove_watermark: bool = False
 
 @app.get("/")
 def root():
     return {"message": "YouTube Downloader API is running!"}
+
+@app.options("/analyze")  # Handle preflight requests
+async def analyze_options():
+    return {"message": "OK"}
+
+@app.options("/download")  # Handle preflight requests
+async def download_options():
+    return {"message": "OK"}
 
 @app.post("/analyze")
 async def analyze_video(request: VideoRequest):
@@ -51,7 +66,7 @@ async def analyze_video(request: VideoRequest):
                 format_note = f.get('format_note')
                 format_id = f.get('format_id')
                 
-                # Check if format has watermark (based on format_note)
+                # Check if format has watermark
                 has_watermark = False
                 if format_note and ('watermark' in format_note.lower() or 'watermarked' in format_note.lower()):
                     has_watermark = True
@@ -88,7 +103,6 @@ async def analyze_video(request: VideoRequest):
                 
                 # Check if it has both video and audio
                 has_video = f.get('vcodec') != 'none'
-                has_audio = f.get('acodec') != 'none'
                 
                 # Skip formats without video
                 if not has_video:
@@ -115,7 +129,7 @@ async def analyze_video(request: VideoRequest):
                         'width': width,
                         'fps': fps,
                         'size': size_text,
-                        'has_audio': has_audio,
+                        'has_audio': f.get('acodec') != 'none',
                         'has_watermark': has_watermark,
                         'ext': f.get('ext', 'mp4')
                     })
@@ -147,7 +161,6 @@ async def download_video(request: VideoRequest):
     try:
         # Build format selector based on user preference
         if request.remove_watermark:
-            # Try to get formats without watermark first
             format_selector = 'bestvideo[format_note!~="watermarked"][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best'
         elif request.format_id:
             format_selector = request.format_id
@@ -165,6 +178,7 @@ async def download_video(request: VideoRequest):
             
             # Get the video URL
             video_url = None
+            video_info_height = 0
             
             if request.format_id and not request.remove_watermark:
                 # Find the specific format
@@ -183,9 +197,9 @@ async def download_video(request: VideoRequest):
                             if 'watermark' in format_note.lower() or 'watermarked' in format_note.lower():
                                 continue
                         
-                        if not video_url or (f.get('height') or 0) > (video_info_height or 0):
+                        if not video_url or (f.get('height') or 0) > video_info_height:
                             video_url = f.get('url')
-                            video_info_height = f.get('height')
+                            video_info_height = f.get('height') or 0
             
             if not video_url:
                 video_url = info.get('url')
@@ -205,7 +219,12 @@ async def download_video(request: VideoRequest):
                 return StreamingResponse(
                     io.BytesIO(response.content),
                     media_type="video/mp4",
-                    headers={"Content-Disposition": f"attachment; filename={filename}"}
+                    headers={
+                        "Content-Disposition": f"attachment; filename={filename}",
+                        "Access-Control-Allow-Origin": "*",  # Add this header
+                        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                        "Access-Control-Allow-Headers": "*",
+                    }
                 )
                 
     except Exception as e:
@@ -214,4 +233,4 @@ async def download_video(request: VideoRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
